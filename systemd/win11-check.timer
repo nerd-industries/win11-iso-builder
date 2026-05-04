@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Windows 11 25H2 build check timer
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=2h
+Persistent=true
+Unit=win11-check.service
+
+[Install]
+WantedBy=timers.target

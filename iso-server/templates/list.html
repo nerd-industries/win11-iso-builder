@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}ISOs — Windows ISO Server{% endblock %}
+{% block content %}
+{% if isos %}
+<table class="isos">
+  <thead>
+    <tr><th>File</th><th>Size</th><th>Built (UTC)</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for iso in isos %}
+    <tr>
+      <td class="name"><code>{{ iso.name }}</code></td>
+      <td class="size">{{ iso.size_human }}</td>
+      <td class="mtime">{{ iso.mtime_human }}</td>
+      <td class="dl"><a href="/iso/{{ iso.name|urlencode }}">download</a></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+<p class="hint">
+  Right-click <code>download</code> &rarr; copy link to use a download manager.
+  Append <code>?token=YOUR_PASSWORD</code> or use HTTP Basic auth.
+</p>
+{% else %}
+<p class="empty">No ISOs yet — the daily build will populate this when a new build is published.</p>
+{% endif %}
+<p class="logout"><a href="/logout">Log out</a></p>
+{% endblock %}

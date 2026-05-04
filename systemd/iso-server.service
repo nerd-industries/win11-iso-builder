@@ -1,0 +1,24 @@
+[Unit]
+Description=Windows ISO download server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=winbuild
+Group=winbuild
+EnvironmentFile=/etc/iso-server.env
+WorkingDirectory=/srv/iso-server
+ExecStart=/srv/iso-server/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8080
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/srv/iso /srv/iso-server /var/log/win11-builder
+
+[Install]
+WantedBy=multi-user.target

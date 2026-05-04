@@ -1,0 +1,18 @@
+# Build artifacts
+/tmp/
+*.iso
+*.zip
+*.deb
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Editor
+*.swp
+.DS_Store
+
+# Local secrets (never commit)
+*.env

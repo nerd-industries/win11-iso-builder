@@ -1,0 +1,18 @@
+[Unit]
+Description=Daily Windows 11 25H2 build check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# simple, not oneshot, so `systemctl start` returns immediately while the
+# 1-2h build runs in the background. systemd still tracks the process and
+# will skip subsequent timer fires if a build is already in flight.
+Type=simple
+ExecStart=/usr/local/bin/win11-check.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=14400
+
+[Install]
+# No WantedBy — fired by .timer only

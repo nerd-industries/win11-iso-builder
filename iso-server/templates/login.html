@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Login — Windows ISO Server{% endblock %}
+{% block content %}
+<form method="post" action="/login" class="login">
+  {% if error %}<p class="error">{{ error }}</p>{% endif %}
+  <label>
+    Password
+    <input type="password" name="password" autofocus required />
+  </label>
+  <button type="submit">Enter</button>
+</form>
+{% endblock %}
