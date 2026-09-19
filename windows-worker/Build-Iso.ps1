@@ -72,6 +72,26 @@ if (Test-Path $WorkDir) {
 }
 New-Item -ItemType Directory -Force -Path $WorkDir, $OutDir | Out-Null
 
+# 1b. Purge old BuildOut ISOs BEFORE the space-hungry DISM step. Each finished
+#     ISO is pulled to the Linux orchestrator immediately (which keeps its own
+#     last-3 in /srv/iso), so the worker doesn't need to hoard them. Left
+#     unchecked they piled up to 60 GB and starved DISM's component-store
+#     scratch, causing CU integration to fail with 0x80070070 (ERROR_DISK_FULL)
+#     and silently emit a base, un-integrated ISO. Keep only the single most
+#     recent previous ISO as a re-pull safety net.
+$oldIsos = Get-ChildItem "$OutDir\*.iso" -ErrorAction SilentlyContinue |
+           Sort-Object LastWriteTime -Descending | Select-Object -Skip 1
+foreach ($old in $oldIsos) {
+    Status ("  Purging old BuildOut ISO: {0} ({1:N1} GB)" -f $old.Name, ($old.Length/1GB))
+    Remove-Item $old.FullName -Force -ErrorAction SilentlyContinue
+}
+$freeGb = (Get-PSDrive C).Free / 1GB
+Status ("Free space on C: before build: {0:N1} GB" -f $freeGb)
+if ($freeGb -lt 40) {
+    Write-Error ("Only {0:N1} GB free on C: - DISM CU integration needs ~40 GB scratch. Aborting before wasting a download." -f $freeGb)
+    exit 1
+}
+
 # 2. Fetch UUP Dump converter package with CU integration enabled.
 #    UUP Dump's get.php requires POST with form fields autodl=2 (script bundle),
 #    updates=1 (integrate cumulative updates), cleanup=1 (clean intermediate files).
@@ -124,7 +144,7 @@ if (-not (Test-Path $cmdScript)) {
 Status "Running converter (long step: 30-90 min)"
 $converterLog    = Join-Path $WorkDir 'converter.log'
 $converterErrLog = Join-Path $WorkDir 'converter.err.log'
-Status "  Converter stdout/stderr → $converterLog / $converterErrLog"
+Status "  Converter stdout/stderr -> $converterLog / $converterErrLog"
 $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', $cmdScript `
     -WorkingDirectory $pkgDir -Wait -PassThru `
     -RedirectStandardOutput $converterLog `

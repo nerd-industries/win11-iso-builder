@@ -4,7 +4,7 @@
 {% if isos %}
 <table class="isos">
   <thead>
-    <tr><th>File</th><th>Size</th><th>Built (UTC)</th><th></th></tr>
+    <tr><th>File</th><th>Size</th><th>Built (UTC)</th><th></th><th></th></tr>
   </thead>
   <tbody>
     {% for iso in isos %}
@@ -13,16 +13,57 @@
       <td class="size">{{ iso.size_human }}</td>
       <td class="mtime">{{ iso.mtime_human }}</td>
       <td class="dl"><a href="/iso/{{ iso.name|urlencode }}">download</a></td>
+      <td class="copy">
+        <button type="button" class="copy-aria"
+                data-cmd="aria2c -x 16 -s 16 -k 1M -c --max-tries=10 --retry-wait=3 -o &quot;{{ iso.name }}&quot; &quot;{{ public_url }}/iso/{{ iso.name }}?token=YOUR_PASSWORD&quot;">
+          copy aria2c
+        </button>
+      </td>
     </tr>
     {% endfor %}
   </tbody>
 </table>
 <p class="hint">
-  Right-click <code>download</code> &rarr; copy link to use a download manager.
-  Append <code>?token=YOUR_PASSWORD</code> or use HTTP Basic auth.
+  <code>copy aria2c</code> puts a ready-to-run download command on your clipboard
+  (16-connection, resumable, password baked in). Or right-click
+  <code>download</code> &rarr; copy link and append
+  <code>?token=YOUR_PASSWORD</code>.
 </p>
 {% else %}
 <p class="empty">No ISOs yet — the daily build will populate this when a new build is published.</p>
 {% endif %}
 <p class="logout"><a href="/logout">Log out</a></p>
+
+<script>
+document.querySelectorAll("button.copy-aria").forEach(function (btn) {
+  btn.addEventListener("click", function () {
+    var cmd = btn.getAttribute("data-cmd");
+    var done = function () {
+      var orig = btn.textContent;
+      btn.textContent = "copied ✓";
+      btn.classList.add("copied");
+      setTimeout(function () {
+        btn.textContent = orig;
+        btn.classList.remove("copied");
+      }, 1500);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(cmd).then(done, function () { fallback(cmd, done); });
+    } else {
+      fallback(cmd, done);
+    }
+  });
+});
+function fallback(text, done) {
+  var ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  try { document.execCommand("copy"); done(); } catch (e) {}
+  document.body.removeChild(ta);
+}
+</script>
 {% endblock %}

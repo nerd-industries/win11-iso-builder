@@ -22,8 +22,8 @@ A daily-fired pipeline that:
    - Removes `SetupPrep.exe`/`SetupHost.exe` to force the classic installer
 5. Replaces `appraiserres.dll` with the Win10 15063 version.
 6. Adds a generic `ei.cfg` to bypass the product-key gate.
-7. Injects Intel RST drivers into every image of `boot.wim` under `\$WinPEDriver$\` (auto-loaded by WinPE; persisted into the installed OS).
-8. Splits `install.wim` into `.swm` chunks (works around ISO9660 4 GiB limit on Debian's xorriso, which lacks UDF).
+7. Stages Intel RST drivers on the ISO root under `\Drivers\` for manual load during Setup. (Auto-loading via `\$WinPEDriver$\` was removed — shipping every driver generation there caused driver-load hangs on modern Intel chipsets from overlapping PCI IDs.)
+8. Builds a UDF ISO with `genisoimage` so the single `install.wim` (>4 GiB) fits and still boots BIOS+UEFI — the same layout Microsoft's retail media uses, so tools that don't reassemble split WIMs work.
 9. Builds the final BIOS+UEFI bootable ISO.
 10. Deploys to a directory served by FastAPI behind a Cloudflare Tunnel.
 11. Emails the download URL to the configured address.
@@ -291,8 +291,8 @@ These bit during development. Documented so they don't bite you.
 6. **Windows Defender scans `%TEMP%`.** DISM scratches there. Real-time scanning slows DISM ~10x. The provisioning step disables RT monitoring.
 7. **DISM offline servicing needs ~50-60 GB scratch space** during CU application. Plan disk accordingly.
 8. **NetBIOS hostname max is 15 chars.** Anything longer silently truncates.
-9. **Debian's xorriso lacks UDF.** This repo splits `install.wim` into `.swm` chunks at 3500 MiB each as the workaround.
-10. **xorriso 1.5.6 dropped `-boot-load-seg`, `-allow-limited-size`, and `-udf`.** The build_iso command is written for 1.5.6+. If you target older xorriso, restore those flags.
+9. **Debian's xorriso lacks UDF.** The CU-integrated `install.wim` is >4 GiB, which ISO9660 can't hold as a single file. Rather than split into `.swm` chunks, the ISO is built with `genisoimage -udf -allow-limited-size` — a single `install.wim` on UDF that Windows Setup reads exactly like retail media. `build_iso` self-verifies both boot records and that `install.wim` reads at full size via a UDF loop-mount.
+10. **xorriso 1.5.6 has no `-udf`/`-allow-limited-size`.** That's why `build_iso` uses `genisoimage` for the final image — the `xorriso` path can't hold a single >4 GiB file, only `.swm` splits.
 11. **systemd `Type=oneshot` blocks `systemctl start` until the script exits.** Use `Type=simple` for long-running services so manual triggers return immediately.
 12. **Bash `BASE_ISO=""` global init clobbers env-var override.** This repo uses `BASE_ISO="${BASE_ISO:-}"` to preserve env values.
 13. **PowerShell unicode em-dashes in script source can cause parse errors** when SCPed via different encodings. Use ASCII-only.

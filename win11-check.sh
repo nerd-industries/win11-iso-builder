@@ -114,9 +114,22 @@ local_build=$(ls "$ISO_DIR"/Win11-25H2-Pro-*-RST-Rufus.iso 2>/dev/null \
               | sed -E 's/.*Pro-([0-9.]+)-RST-Rufus.*/\1/' \
               | sort -V | tail -1)
 
-if [[ "$api_build" == "$local_build" ]]; then
-    log "Up to date ($local_build) — nothing to do"
-    exit 0
+# Build ONLY when UUP's offering is strictly newer than what we already have.
+# UUP Dump occasionally rolls its "latest" entry back to an older build (it
+# republishes older builds, and find_latest_build sorts by creation date, so a
+# re-published older build can become "latest"). A plain != test treated that
+# rollback as a new build and rebuilt the older one nightly — which then failed
+# on its own. Compare by version instead.
+if [[ -n "$local_build" ]]; then
+    if [[ "$api_build" == "$local_build" ]]; then
+        log "Up to date ($local_build) — nothing to do"
+        exit 0
+    fi
+    newer=$(printf '%s\n%s\n' "$api_build" "$local_build" | sort -V | tail -1)
+    if [[ "$newer" != "$api_build" ]]; then
+        log "UUP offering ($api_build) is OLDER than local ($local_build) — skipping (UUP rollback)"
+        exit 0
+    fi
 fi
 
 log "New build available: $api_build (local: ${local_build:-none})"

@@ -12,12 +12,14 @@
 set -euo pipefail
 
 # ─── Configuration ────────────────────────────────────────────────────────────
-readonly KIT_DIR="/tmp/win_fix_kit/Win_11_Boot_And_Upgrade_FiX_KiT_v6.1f2"
+# Kit lives next to the repo, NOT /tmp — systemd-tmpfiles wipes /tmp entries
+# untouched for 10 days, which silently killed daily builds (June 2026).
+readonly KIT_DIR="${KIT_DIR:-/root/win-build/kit/Win_11_Boot_And_Upgrade_FiX_KiT_v6.1f2}"
 readonly WORK_DIR="/var/lib/win11-builder"
-readonly UUP_LANG="en-us"          # separate from $LANG (system locale)
-readonly UUP_EDITION="professional"
-readonly TARGET_PREFIX="26200"        # 25H2 = build family 26200; 26100 is 24H2
-readonly TARGET_VERSION_NAME="25H2"   # also matched against title to skip update-only packages
+readonly UUP_LANG="${UUP_LANG:-en-us}"          # separate from $LANG (system locale)
+readonly UUP_EDITION="${UUP_EDITION:-professional}"
+readonly TARGET_PREFIX="${TARGET_PREFIX:-26200}"        # 25H2 = build family 26200; 26100 is 24H2; 22631 is 23H2
+readonly TARGET_VERSION_NAME="${TARGET_VERSION_NAME:-25H2}"   # also matched against title to skip update-only packages
 readonly UUP_API="https://api.uupdump.net"
 readonly UUP_BASE="https://uupdump.net"
 
@@ -50,6 +52,7 @@ install_deps() {
     command -v chntpw        &>/dev/null || missing+=(chntpw)
     command -v wimlib-imagex &>/dev/null || missing+=(wimtools)
     command -v xorriso       &>/dev/null || missing+=(xorriso)
+    command -v genisoimage   &>/dev/null || missing+=(genisoimage)
     command -v jq            &>/dev/null || missing+=(jq)
     command -v rsync         &>/dev/null || missing+=(rsync)
     command -v ssh           &>/dev/null || missing+=(openssh-client)
@@ -58,7 +61,7 @@ install_deps() {
         log "Installing missing packages: ${missing[*]}"
         sudo apt-get install -y --no-install-recommends "${missing[@]}"
     fi
-    for cmd in chntpw wimlib-imagex xorriso jq python3 ssh scp; do
+    for cmd in chntpw wimlib-imagex xorriso genisoimage jq python3 ssh scp; do
         command -v "$cmd" &>/dev/null || die "Still missing: $cmd"
     done
     python3 -c "import hivex" 2>/dev/null || die "python-hivex not available (apt install python3-hivex)"
@@ -127,7 +130,14 @@ fetch_iso_from_windows() {
     # and then re-quotes them when invoking the child powershell.exe — so quoted
     # values arrive at Build-Iso.ps1 with embedded single quotes. UUID, edition,
     # lang, and build all have no spaces, so unquoted is safe.
-    remote=$(ssh "${WIN_WORKER_USER}@${WIN_WORKER_HOST}" \
+    # ServerAliveInterval=60 + CountMax=10 keeps the TCP alive through the
+    # converter's tens-of-minutes silent stretches. Without these, idle-firewall
+    # drops can sever the connection mid-build with no error logged on either
+    # side (Build-Iso.ps1 finishes locally on the worker but its final stdout
+    # is lost, and bash here returns non-zero — or worse, hangs).
+    local ssh_opts=(-o ServerAliveInterval=60 -o ServerAliveCountMax=10 -o TCPKeepAlive=yes)
+
+    remote=$(ssh "${ssh_opts[@]}" "${WIN_WORKER_USER}@${WIN_WORKER_HOST}" \
         "powershell -ExecutionPolicy Bypass -File $WIN_WORKER_SCRIPT \
          -Uuid $UUID -Edition $UUP_EDITION -Lang $UUP_LANG -Build $BUILD") \
         || die "Windows worker SSH/script failed (worker offline? script crashed? See stderr above)"
@@ -139,7 +149,7 @@ fetch_iso_from_windows() {
     local local_path="$WORK_DIR/$(basename "$remote")"
     log "SCPing $remote → $local_path"
     # OpenSSH accepts forward slashes for Windows paths; translate \ → /
-    scp "${WIN_WORKER_USER}@${WIN_WORKER_HOST}:${remote//\\//}" "$local_path" \
+    scp "${ssh_opts[@]}" "${WIN_WORKER_USER}@${WIN_WORKER_HOST}:${remote//\\//}" "$local_path" \
         || die "SCP from Windows worker failed"
 
     BASE_ISO="$local_path"
@@ -212,8 +222,15 @@ verify_build_number() {
     info "  install.wim metadata: Version=$wim_version, Edition=${edition:-?}"
     info "  (install.wim metadata reports the base family — 25H2 enablement applies at runtime)"
 
-    if [[ "$build" != "26100" && "$build" != "26200" ]]; then
-        die "install.wim Build is $build — neither 26100 (24H2 base) nor 26200 (25H2 base). Unknown family — aborting."
+    # Allowed build families. Override via env (space-separated) for one-off
+    # builds against unusual versions, e.g. ALLOWED_BUILD_FAMILIES="22631 26100 26200"
+    local allowed="${ALLOWED_BUILD_FAMILIES:-26100 26200}"
+    local family_ok=0
+    for f in $allowed; do
+        [[ "$build" == "$f" ]] && family_ok=1 && break
+    done
+    if [[ $family_ok -eq 0 ]]; then
+        die "install.wim Build is $build — not in allowed families ($allowed). Override with ALLOWED_BUILD_FAMILIES env var if intentional."
     fi
     log "Build verification OK"
 }
@@ -387,15 +404,21 @@ modify_boot_wim() {
         --command="add '$tmp/winsetup.dll' '\sources\winsetup.dll'"
 
     # ── Remove SetupPrep.exe + SetupHost.exe (classic installer enforcement) ──
+    # NOTE: `wimlib-imagex delete` deletes ENTIRE IMAGES from a WIM. To delete
+    # paths INSIDE an image, use `wimlib-imagex update --command="delete ..."`.
+    # Earlier versions of this script used the wrong command and silently no-op'd.
     log "Removing SetupPrep.exe / SetupHost.exe from boot.wim index 2..."
 
     for wim_path in '/sources/SetupPrep.exe' '/sources/SetupHost.exe'; do
-        wimlib-imagex delete "$boot_wim" 2 "$wim_path" 2>/dev/null \
-            && log "  Deleted: $wim_path" || info "  Not found: $wim_path"
+        if wimlib-imagex update "$boot_wim" 2 \
+               --command="delete --force $wim_path" >/dev/null 2>&1; then
+            log "  Deleted: $wim_path"
+        else
+            info "  Not found: $wim_path"
+        fi
     done
 
     # Remove WinSxS component-store copies so they can't restore the binaries.
-    # wimlib-imagex dir outputs forward-slash paths on Linux.
     local wim_listing
     wim_listing=$(wimlib-imagex dir "$boot_wim" 2 2>/dev/null)
 
@@ -409,14 +432,22 @@ modify_boot_wim() {
 
     for dir in "${base_dirs[@]}"; do
         for suffix in "/SetupPrep.exe" "/r/SetupPrep.exe"; do
-            wimlib-imagex delete "$boot_wim" 2 "${dir}${suffix}" 2>/dev/null \
-                && log "  Deleted: ${dir}${suffix}" || info "  Not found: ${dir}${suffix}"
+            if wimlib-imagex update "$boot_wim" 2 \
+                   --command="delete --force ${dir}${suffix}" >/dev/null 2>&1; then
+                log "  Deleted: ${dir}${suffix}"
+            else
+                info "  Not found: ${dir}${suffix}"
+            fi
         done
     done
     for dir in "${onecore_dirs[@]}"; do
         for suffix in "/SetupHost.exe" "/r/SetupHost.exe"; do
-            wimlib-imagex delete "$boot_wim" 2 "${dir}${suffix}" 2>/dev/null \
-                && log "  Deleted: ${dir}${suffix}" || info "  Not found: ${dir}${suffix}"
+            if wimlib-imagex update "$boot_wim" 2 \
+                   --command="delete --force ${dir}${suffix}" >/dev/null 2>&1; then
+                log "  Deleted: ${dir}${suffix}"
+            else
+                info "  Not found: ${dir}${suffix}"
+            fi
         done
     done
 
@@ -457,9 +488,16 @@ apply_option_8() {
     log "ei.cfg added"
 }
 
-# ─── Inject Intel RST drivers ────────────────────────────────────────────────
+# ─── Stage Intel RST drivers on ISO root (no $WinPEDriver$ auto-load) ─────────
+# Auto-loading via $WinPEDriver$ caused "failed to load drivers" hangs on
+# modern Intel chipsets because the bundle ships multiple driver generations
+# with overlapping PCI HardwareIDs (8-9 and 10-11 AHCI/RAID, 10-11 and 12-15
+# VMD). WinPE binds every .inf in $WinPEDriver$, and the conflict locks Setup
+# for ~60-90s before it gives up. We now stage the full bundle on the ISO root
+# at \Drivers\ only — the tech can "Load driver" from Setup if storage isn't
+# detected. Two extra clicks vs. a guaranteed boot.
 inject_rst_drivers() {
-    hdr "Injecting Intel RST drivers"
+    hdr "Staging Intel RST drivers on ISO root"
 
     local rst_archive="$(dirname "$0")/RST_ALL_DRIVERS.tar.gz"
     [[ -f "$rst_archive" ]] || die "RST archive not found: $rst_archive"
@@ -473,37 +511,27 @@ inject_rst_drivers() {
         info "RST drivers already extracted at $rst_dir"
     fi
 
+    # Strip any prior $WinPEDriver$ from boot.wim in case STAGING was reused.
     local boot_wim="$STAGING/sources/boot.wim"
     [[ -f "$boot_wim" ]] || die "boot.wim not found at $boot_wim"
     chmod u+w "$boot_wim"
-
-    # Inject into every image in boot.wim under \$WinPEDriver$\
     local image_count
     image_count=$(wimlib-imagex info "$boot_wim" 2>&1 \
                   | awk -F: '/^Image Count:/ { gsub(/ /,"",$2); print $2 }')
     [[ -n "$image_count" && "$image_count" -ge 1 ]] \
         || die "Could not determine image count of boot.wim"
-    log "boot.wim has $image_count image(s); injecting drivers into each"
-
     local i
     for ((i=1; i<=image_count; i++)); do
-        log "  Image $i: adding RST_ALL_DRIVERS → \$WinPEDriver\$"
-        # Delete any prior copy first so re-runs (e.g. STAGING=...) don't fail
-        # on "destination already exists". --force lets it succeed when absent.
         wimlib-imagex update "$boot_wim" "$i" \
             --command="delete --force --recursive '\$WinPEDriver\$'" \
             >/dev/null 2>&1 || true
-        wimlib-imagex update "$boot_wim" "$i" \
-            --command="add '$rst_dir/RST_ALL_DRIVERS' '\$WinPEDriver\$'" \
-            || die "Failed to inject drivers into boot.wim image $i"
     done
 
-    # Manual-install fallback: copy onto ISO root
     log "Copying RST_ALL_DRIVERS to ISO root as \\Drivers\\"
     rm -rf "$STAGING/Drivers"
     cp -r "$rst_dir/RST_ALL_DRIVERS" "$STAGING/Drivers"
 
-    log "RST driver injection complete"
+    log "RST driver staging complete (manual load via Setup → Load driver)"
 }
 
 # ─── Copy 24H2 online upgrade enabler script ──────────────────────────────────
@@ -522,38 +550,30 @@ copy_enabler_script() {
 # split it into install.swm + install2.swm + ... at 3500 MiB each. Microsoft's
 # Setup reads .swm files transparently (this is the canonical solution for
 # FAT32 USB sticks too).
-split_install_wim_if_oversize() {
-    local wim="$STAGING/sources/install.wim"
-    [[ -f "$wim" ]] || return 0
-    local size_bytes
-    size_bytes=$(stat -c%s "$wim")
-    local max_bytes=$((4*1024*1024*1024 - 1))   # 4 GiB - 1 byte (ISO9660 limit)
-    if (( size_bytes <= max_bytes )); then
-        log "install.wim is $(du -h "$wim" | cut -f1) — fits in ISO9660, no split needed"
-        return 0
-    fi
-
-    hdr "Splitting install.wim ($(du -h "$wim" | cut -f1)) into .swm chunks (ISO9660 4GiB limit)"
-    wimlib-imagex split "$wim" "$STAGING/sources/install.swm" 3500 \
-        || die "wimlib-imagex split failed"
-    rm -f "$wim"
-    log "Split result:"
-    ls -lh "$STAGING/sources/"install*.swm | sed 's/^/    /'
-}
-
 # ─── Build final bootable ISO ─────────────────────────────────────────────────
 build_iso() {
-    hdr "Building bootable ISO"
+    hdr "Building bootable ISO (UDF, single install.wim)"
 
-    split_install_wim_if_oversize
+    # We build UDF via genisoimage so a >4 GiB install.wim ships as a SINGLE file
+    # and still boots BIOS+UEFI -- the same filesystem Microsoft's retail media
+    # uses. (Debian's xorriso 1.5.6 lacks UDF, which previously forced splitting
+    # install.wim into .swm chunks on ISO9660. Customers want a single
+    # install.wim, so we use genisoimage's -udf -allow-limited-size instead.)
+    local wim="$STAGING/sources/install.wim"
+    [[ -f "$wim" ]] || die "install.wim missing from staging: $wim"
+    # Guard against a stale split left in a reused STAGING dir.
+    rm -f "$STAGING"/sources/install*.swm
+    log "install.wim: $(du -h "$wim" | cut -f1) (single file)"
 
-    # Volume label: WIN_11_26200_8328_X64_EN-US (max 32 chars for UDF)
+    # Volume label: WIN_11_26200_8328_X64_EN-US (max 32 chars)
     [[ -z "$BUILD" ]] && BUILD="unknown"
     local clean_build="${BUILD//./_}"
     local volid="WIN_11_${clean_build}_X64_EN-US"
     volid="${volid:0:32}"
 
-    local output_iso="$WORK_DIR/Win11-25H2-Pro-${BUILD}-RST-Rufus.iso"
+    # Output filename is overridable via OUTPUT_ISO_NAME for one-off builds of
+    # other families (e.g. 23H2). Default preserves the daily 25H2 naming.
+    local output_iso="$WORK_DIR/${OUTPUT_ISO_NAME:-Win11-25H2-Pro-${BUILD}-RST-Rufus.iso}"
 
     # Verify boot files exist in staging
     local bios_boot="$STAGING/boot/etfsboot.com"
@@ -564,28 +584,50 @@ build_iso() {
     log "Volume label: $volid"
     log "Output:       $output_iso"
 
-    local xorriso_log="$WORK_DIR/xorriso.log"
-    # Notes:
-    #   - xorriso 1.5.6 removed -boot-load-seg (defaults to 0x07C0 with -no-emul-boot)
-    #   - Debian's xorriso is built without UDF; we rely on .swm split + ISO9660+Joliet
-    #   - -iso-level 3 allows files up to 4 GiB - 1 byte (max for ISO9660)
-    xorriso -as mkisofs \
-        -b "boot/etfsboot.com" \
-        -no-emul-boot \
-        -boot-load-size 8 \
-        -boot-info-table \
-        -eltorito-alt-boot \
-        -e "efi/microsoft/boot/efisys.bin" \
-        -no-emul-boot \
-        -iso-level 3 \
-        -J -joliet-long \
-        -volid "$volid" \
+    local gi_log="$WORK_DIR/genisoimage.log"
+    # -udf + -allow-limited-size: UDF holds the true (>4 GiB) file size; Windows
+    #   Setup reads via UDF, exactly like official media.
+    # El Torito: BIOS (etfsboot.com, with boot-info-table) + UEFI (efisys.bin).
+    genisoimage -quiet \
+        -udf -allow-limited-size \
+        -iso-level 3 -J -joliet-long \
+        -V "$volid" \
+        -b boot/etfsboot.com -no-emul-boot -boot-load-size 8 -boot-info-table \
+        -eltorito-alt-boot -e efi/microsoft/boot/efisys.bin -no-emul-boot \
         -o "$output_iso" \
         "$STAGING" \
-        > "$xorriso_log" 2>&1 \
-        || { tail -20 "$xorriso_log" >&2; die "xorriso failed - see above"; }
+        > "$gi_log" 2>&1 \
+        || { tail -20 "$gi_log" >&2; die "genisoimage failed - see above"; }
+    [[ -f "$output_iso" ]] || die "genisoimage exited OK but output ISO not found"
 
-    [[ -f "$output_iso" ]] || die "xorriso exited OK but output ISO not found"
+    # Verify: both boot records present, and the single install.wim reads at its
+    # full byte size through UDF (catches a silent >4 GiB truncation).
+    # NOTE: grep -c / ls-glob return non-zero on "no match", which under
+    # `set -euo pipefail` would abort the script BEFORE the die messages fire.
+    # Append `|| true` / use a nullglob array so the [[ ]] checks do the failing
+    # with a real message instead of a silent set -e exit.
+    local bios uefi
+    bios=$(xorriso -indev "$output_iso" -report_el_torito plain 2>/dev/null | grep -c 'BIOS' || true)
+    uefi=$(xorriso -indev "$output_iso" -report_el_torito plain 2>/dev/null | grep -c 'UEFI' || true)
+    [[ "$bios" -ge 1 && "$uefi" -ge 1 ]] || die "boot records incomplete (BIOS=$bios UEFI=$uefi)"
+    local exp_sz vmnt act_sz
+    exp_sz=$(stat -c%s "$wim")
+    vmnt="$WORK_DIR/verify_mnt"; mkdir -p "$vmnt"
+    if mount -o loop,ro -t udf "$output_iso" "$vmnt" 2>/dev/null; then
+        act_sz=$(stat -c%s "$vmnt/sources/install.wim" 2>/dev/null || echo 0)
+        local swmfiles
+        shopt -s nullglob
+        swmfiles=("$vmnt"/sources/install*.swm)
+        shopt -u nullglob
+        umount "$vmnt"
+        [[ ${#swmfiles[@]} -eq 0 ]] || die "ISO still contains .swm parts (${#swmfiles[@]})"
+        [[ "$act_sz" == "$exp_sz" ]] || die "install.wim truncated in ISO (expected $exp_sz, got $act_sz)"
+        log "Verified: single install.wim ($act_sz bytes), BIOS+UEFI boot, UDF"
+    else
+        log "WARN: could not UDF-mount output for verification (continuing)"
+    fi
+    rmdir "$vmnt" 2>/dev/null || true
+
     log "ISO created: $output_iso ($(du -sh "$output_iso" | cut -f1))"
     FINAL_ISO="$output_iso"
 }

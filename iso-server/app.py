@@ -27,7 +27,32 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 # ─── Configuration (env-driven) ──────────────────────────────────────────────
-PASSWORD = os.environ["ISO_PASSWORD"]
+# Passwords come from ISO_PASSWORDS (colon-separated list) and/or ISO_PASSWORD
+# (single, kept for backwards compat). All entries are accepted by all three
+# auth doors. Comparisons use hmac.compare_digest in any_password_matches().
+_pw_list = os.environ.get("ISO_PASSWORDS", "").split(":") + [os.environ.get("ISO_PASSWORD", "")]
+PASSWORDS = tuple(p for p in _pw_list if p)
+if not PASSWORDS:
+    raise RuntimeError("Set ISO_PASSWORD and/or ISO_PASSWORDS in env")
+# Kept for legacy import compat — represents "any" password
+PASSWORD = PASSWORDS[0]
+
+
+def any_password_matches(candidate: str) -> bool:
+    """Constant-time compare against the full password set.
+
+    Always compares against every entry (no short-circuit) so total time
+    doesn't reveal which password matched or how many entries exist.
+    """
+    if not candidate:
+        return False
+    matched = False
+    for pw in PASSWORDS:
+        if hmac.compare_digest(candidate, pw):
+            matched = True
+    return matched
+
+
 COOKIE_SECRET = os.environ["ISO_COOKIE_SECRET"].encode()
 ISO_DIR = Path(os.environ["ISO_DIR"])
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "")
@@ -86,14 +111,14 @@ def authed(request: Request) -> bool:
         try:
             decoded = base64.b64decode(auth[6:]).decode()
             _, _, pw = decoded.partition(":")
-            if pw and hmac.compare_digest(pw, PASSWORD):
+            if any_password_matches(pw):
                 return True
         except Exception:
             pass
 
     # 3. Query token
     token = request.query_params.get("token", "")
-    if token and hmac.compare_digest(token, PASSWORD):
+    if any_password_matches(token):
         return True
 
     return False
@@ -122,7 +147,7 @@ def login_get(request: Request):
 
 @app.post("/login")
 def login_post(request: Request, password: str = Form(...)):
-    if not hmac.compare_digest(password, PASSWORD):
+    if not any_password_matches(password):
         # Re-render with error — 401 status so tests can assert
         return HTMLResponse(
             templates.get_template("login.html").render(
