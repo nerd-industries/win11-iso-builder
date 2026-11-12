@@ -1,6 +1,6 @@
 #!/bin/bash
-# Daily Windows 11 25H2 build check.
-# - Polls UUP Dump for the latest 25H2 (26200.x) full image
+# Daily Windows 11 26H2 build check.
+# - Polls UUP Dump for the latest 26H2 (26300.x) full image
 # - If newer than what's in /srv/iso/, runs win11-builder.sh
 # - On success: moves ISO to /srv/iso/, prunes to last 3, emails success
 # - On failure: emails failure with last 30 lines of log
@@ -11,12 +11,19 @@ ENV_FILE=/etc/iso-server.env
 ISO_DIR=/srv/iso
 LOG_DIR=/var/log/win11-builder
 LOG=$LOG_DIR/check.log
-BUILDER="${BUILDER:-/root/win-build/win11-builder.sh}"
+BUILDER=/root/win-build/win11-builder.sh
 WORK_DIR=/var/lib/win11-builder
 
 UUP_API="https://api.uupdump.net"
-TARGET_PREFIX="26200"
-TARGET_VERSION_NAME="25H2"
+# ── Target Windows release (single source of truth; exported to the builder) ──
+# Switching releases = edit these. 26H2 = build family 26300 (25H2=26200,
+# 24H2=26100). ALLOWED_BUILD_FAMILIES is a superset because install.wim can
+# report an older base family when the release ships as an enablement package.
+VERSION_TAG="26H2"
+TARGET_PREFIX="26300"
+TARGET_VERSION_NAME="26H2"
+ALLOWED_BUILD_FAMILIES="26100 26200 26300"
+export TARGET_PREFIX TARGET_VERSION_NAME ALLOWED_BUILD_FAMILIES
 
 # ─── Bootstrap ───────────────────────────────────────────────────────────────
 mkdir -p "$LOG_DIR" "$ISO_DIR"
@@ -62,7 +69,7 @@ send_success_email() {
     local build="$1" iso_name="$2"
     local body
     body=$(cat <<EOF
-A new Windows 11 25H2 ISO is built and ready.
+A new Windows 11 ${VERSION_TAG} ISO is built and ready.
 
 Build:    $build
 Date:     $(date -u +%Y-%m-%d)
@@ -71,7 +78,7 @@ Download: $PUBLIC_URL/iso/$iso_name
 Log in with your shared password at $PUBLIC_URL/login
 EOF
 )
-    send_email "Windows 11 25H2 build $build ready" "$body"
+    send_email "Windows 11 ${VERSION_TAG} build $build ready" "$body"
 }
 
 send_failure_email() {
@@ -86,7 +93,7 @@ $(tail -n 30 "$LOG" 2>/dev/null || echo "(log unavailable)")
 Full log: $LOG
 EOF
 )
-    send_email "Windows 11 25H2 build $build FAILED" "$body"
+    send_email "Windows 11 ${VERSION_TAG} build $build FAILED" "$body"
 }
 
 # ─── 1. API check ────────────────────────────────────────────────────────────
@@ -101,7 +108,7 @@ api_build=$(echo "$api_resp" | jq -r --arg px "${TARGET_PREFIX}." --arg name "$T
      | select(.arch == "amd64"
               and (.build | startswith($px))
               and (.title | test("^Windows 11, version " + $name + " \\([0-9]+\\.[0-9]+\\)$")))]
-    | sort_by(.created) | reverse | .[0] | .build // empty')
+    | sort_by(.build | split(".") | map(tonumber)) | reverse | .[0] | .build // empty')
 
 if [[ -z "$api_build" ]]; then
     log "API returned no matching $TARGET_VERSION_NAME builds — skipping"
@@ -110,7 +117,7 @@ fi
 log "Latest on UUP Dump: $api_build"
 
 # ─── 2. Compare to local ─────────────────────────────────────────────────────
-local_build=$(ls "$ISO_DIR"/Win11-25H2-Pro-*-RST-Rufus.iso 2>/dev/null \
+local_build=$(ls "$ISO_DIR"/Win11-${VERSION_TAG}-Pro-*-RST-Rufus.iso 2>/dev/null \
               | sed -E 's/.*Pro-([0-9.]+)-RST-Rufus.*/\1/' \
               | sort -V | tail -1)
 
@@ -135,8 +142,11 @@ fi
 log "New build available: $api_build (local: ${local_build:-none})"
 
 # ─── 3. Build ────────────────────────────────────────────────────────────────
+# Name the output up front and hand it to the builder so check + builder agree.
+iso_name="Win11-${VERSION_TAG}-Pro-${api_build}-RST-Rufus.iso"
+export OUTPUT_ISO_NAME="$iso_name"
 rm -rf "$WORK_DIR"
-log "Running $BUILDER ..."
+log "Running $BUILDER (target $TARGET_VERSION_NAME $api_build) ..."
 if ! "$BUILDER"; then
     log "Builder exited non-zero"
     send_failure_email "$api_build"
@@ -144,7 +154,6 @@ if ! "$BUILDER"; then
 fi
 
 # ─── 4. Deploy + prune ───────────────────────────────────────────────────────
-iso_name="Win11-25H2-Pro-${api_build}-RST-Rufus.iso"
 src="$WORK_DIR/$iso_name"
 if [[ ! -f "$src" ]]; then
     log "Builder claimed success but $src missing"
@@ -156,7 +165,7 @@ mv "$src" "$ISO_DIR/$iso_name"
 log "Deployed: $ISO_DIR/$iso_name"
 
 # Prune to last 3 by mtime
-mapfile -t old < <(ls -1t "$ISO_DIR"/Win11-25H2-Pro-*-RST-Rufus.iso 2>/dev/null | tail -n +4)
+mapfile -t old < <(ls -1t "$ISO_DIR"/Win11-${VERSION_TAG}-Pro-*-RST-Rufus.iso 2>/dev/null | tail -n +4)
 for f in "${old[@]}"; do
     rm -f "$f" && log "Pruned: $f"
 done

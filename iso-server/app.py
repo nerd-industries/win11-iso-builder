@@ -179,8 +179,10 @@ def list_isos(request: Request):
     redirect = require_auth_or_redirect(request)
     if redirect:
         return redirect
+    # Show the current + previous feature update during a version transition
+    # (e.g. 25H2 and 26H2). Matches Win11-25H2/26H2-Pro-*-RST-Rufus.iso.
     isos = sorted(
-        ISO_DIR.glob("Win11-25H2-Pro-*-RST-Rufus.iso"),
+        ISO_DIR.glob("Win11-2[56]H2-Pro-*-RST-Rufus.iso"),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )

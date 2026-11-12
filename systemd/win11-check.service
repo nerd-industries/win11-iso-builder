@@ -1,5 +1,5 @@
 [Unit]
-Description=Daily Windows 11 25H2 build check
+Description=Daily Windows 11 26H2 build check
 After=network-online.target
 Wants=network-online.target
 

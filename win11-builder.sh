@@ -18,8 +18,8 @@ readonly KIT_DIR="${KIT_DIR:-/root/win-build/kit/Win_11_Boot_And_Upgrade_FiX_KiT
 readonly WORK_DIR="/var/lib/win11-builder"
 readonly UUP_LANG="${UUP_LANG:-en-us}"          # separate from $LANG (system locale)
 readonly UUP_EDITION="${UUP_EDITION:-professional}"
-readonly TARGET_PREFIX="${TARGET_PREFIX:-26200}"        # 25H2 = build family 26200; 26100 is 24H2; 22631 is 23H2
-readonly TARGET_VERSION_NAME="${TARGET_VERSION_NAME:-25H2}"   # also matched against title to skip update-only packages
+readonly TARGET_PREFIX="${TARGET_PREFIX:-26300}"        # 26H2 = build family 26300; 26200 is 25H2; 26100 is 24H2; 22631 is 23H2
+readonly TARGET_VERSION_NAME="${TARGET_VERSION_NAME:-26H2}"   # also matched against title to skip update-only packages
 readonly UUP_API="https://api.uupdump.net"
 readonly UUP_BASE="https://uupdump.net"
 
@@ -86,7 +86,10 @@ find_latest_build() {
     echo "$resp" | jq -e '.response.builds' &>/dev/null \
         || die "Unexpected API response — no .response.builds field. Raw: ${resp:0:200}"
 
-    # Pick the newest amd64 entry that is BOTH the right build family AND a full
+    # Pick the HIGHEST-numbered amd64 entry (not the most recently posted: UUP
+    # Dump can list a hotpatch build like 26300.9911 after the normal 26300.9974,
+    # and hotpatch packages can't be integrated offline -> base ISO) that is BOTH
+    # the right build family AND a full
     # OS image (title "Windows 11, version 25H2 (XXXXX.YYYY)"). Excludes
     # "Preview Update", "Cumulative Update", and "OOBE Update" packages, which
     # share the build number but are not bootable installers.
@@ -99,7 +102,7 @@ find_latest_build() {
           | select(.arch == "amd64"
                    and (.build | startswith($px))
                    and (.title | test($tre)))]
-         | sort_by(.created) | reverse | .[0]')
+         | sort_by(.build | split(".") | map(tonumber)) | reverse | .[0]')
 
     [[ -n "$match" && "$match" != "null" ]] \
         || die "No full ${TARGET_VERSION_NAME} (${TARGET_PREFIX}.x) amd64 build found. Microsoft may have bumped the build family or UUP Dump may have changed its title format — check https://uupdump.net manually."
@@ -224,7 +227,7 @@ verify_build_number() {
 
     # Allowed build families. Override via env (space-separated) for one-off
     # builds against unusual versions, e.g. ALLOWED_BUILD_FAMILIES="22631 26100 26200"
-    local allowed="${ALLOWED_BUILD_FAMILIES:-26100 26200}"
+    local allowed="${ALLOWED_BUILD_FAMILIES:-26100 26200 26300}"
     local family_ok=0
     for f in $allowed; do
         [[ "$build" == "$f" ]] && family_ok=1 && break
@@ -535,6 +538,75 @@ inject_rst_drivers() {
 }
 
 # ─── Copy 24H2 online upgrade enabler script ──────────────────────────────────
+# --- Bake OOBE skip values into install.wim's SOFTWARE hive (no setup-time commands) ---
+# On 26H2 any command in the specialize pass fails setup, so these live in the image.
+bake_oobe_registry() {
+    hdr "Baking OOBE registry values into install.wim"
+    local wim="$STAGING/sources/install.wim" tmp n i
+    [[ -f "$wim" ]] || die "install.wim missing: $wim"
+    chmod u+w "$wim"
+    tmp=$(mktemp -d)
+    n=$(wimlib-imagex info "$wim" | awk -F: '/^Image Count:/{gsub(/ /,"",$2);print $2}')
+    for ((i=1; i<=n; i++)); do
+        rm -f "$tmp/SOFTWARE"
+        wimlib-imagex extract "$wim" "$i" /Windows/System32/config/SOFTWARE --dest-dir="$tmp" --no-acls >/dev/null \
+            || die "extract SOFTWARE from image $i failed"
+        python3 - "$tmp/SOFTWARE" <<'PYH' || die "hive edit failed (image $i)"
+import hivex, struct, sys
+h = hivex.Hivex(sys.argv[1], write=True)
+n = h.root()
+for part in r"Microsoft\Windows\CurrentVersion\OOBE".split("\\"):
+    c = h.node_get_child(n, part)
+    n = c if c else h.node_add_child(n, part)
+for name in ("BypassNRO", "HideOnlineAccountScreens", "HideWirelessSetupInOOBE"):
+    h.node_set_value(n, {"key": name, "t": 4, "value": struct.pack("<I", 1)})
+h.commit(None)
+for name in ("BypassNRO", "HideOnlineAccountScreens", "HideWirelessSetupInOOBE"):
+    v = h.node_get_value(n, name)
+    assert struct.unpack("<I", h.value_value(v)[1])[0] == 1, name
+PYH
+        wimlib-imagex update "$wim" "$i" --command="add $tmp/SOFTWARE /Windows/System32/config/SOFTWARE" >/dev/null \
+            || die "wimlib update image $i failed"
+        log "  image $i: BypassNRO/HideOnlineAccountScreens/HideWirelessSetupInOOBE = 1"
+        # SYSTEM hive: stop automatic BitLocker device encryption (24H2+ encrypts almost
+        # any TPM+SecureBoot laptop during setup; with a local account the recovery key
+        # is never backed up). BitLocker stays available for manual use.
+        # Smart App Control off from first boot (otherwise it evaluates then can turn
+        # itself On ~a day later and block unsigned apps), and S mode explicitly off.
+        rm -f "$tmp/SYSTEM"
+        wimlib-imagex extract "$wim" "$i" /Windows/System32/config/SYSTEM --dest-dir="$tmp" --no-acls >/dev/null \
+            || die "extract SYSTEM from image $i failed"
+        python3 - "$tmp/SYSTEM" <<'PYS' || die "SYSTEM hive edit failed (image $i)"
+import hivex, struct, sys
+h = hivex.Hivex(sys.argv[1], write=True)
+def key(path):
+    n = h.root()
+    for part in path.split("\\"):
+        c = h.node_get_child(n, part)
+        n = c if c else h.node_add_child(n, part)
+    return n
+want = {
+    r"ControlSet001\Control\BitLocker": {"PreventDeviceEncryption": 1},
+    r"ControlSet001\Control\CI\Policy": {"VerifiedAndReputablePolicyState": 0, "SkuPolicyRequired": 0},
+}
+for path, vals in want.items():
+    n = key(path)
+    for name, v in vals.items():
+        h.node_set_value(n, {"key": name, "t": 4, "value": struct.pack("<I", v)})
+h.commit(None)
+for path, vals in want.items():
+    n = key(path)
+    for name, v in vals.items():
+        got = struct.unpack("<I", h.value_value(h.node_get_value(n, name))[1])[0]
+        assert got == v, (path, name, got)
+PYS
+        wimlib-imagex update "$wim" "$i" --command="add $tmp/SYSTEM /Windows/System32/config/SYSTEM" >/dev/null \
+            || die "wimlib update SYSTEM image $i failed"
+        log "  image $i: PreventDeviceEncryption=1, SmartAppControl=off, SkuPolicyRequired=0"
+    done
+    rm -rf "$tmp"
+}
+
 copy_enabler_script() {
     hdr "Copying 24H2 Online Upgrade Enabler Script"
     local src="$KIT_DIR/Files/24H2_Online_Upgrade_Enabler_Script.cmd"
@@ -565,6 +637,25 @@ build_iso() {
     rm -f "$STAGING"/sources/install*.swm
     log "install.wim: $(du -h "$wim" | cut -f1) (single file)"
 
+    # autounattend.xml at the ISO root automates OOBE past the Microsoft-account
+    # + network gate and lands on the local-account screen (26H2 removed the
+    # Shift+F10 / bypassnro escape hatches). Setup reads it from the boot-media
+    # root. Overridable/removable via AUTOUNATTEND env (set empty to skip).
+    local unattend="${AUTOUNATTEND:-$(dirname "$0")/autounattend.xml}"
+    if [[ -n "$unattend" && -f "$unattend" ]]; then
+        cp "$unattend" "$STAGING/autounattend.xml"
+        log "autounattend.xml staged at ISO root (OOBE automation)"
+        # setclock.cmd: windowsPE pass moves a stale BIOS clock forward to the build date
+        # (26H2 OOBE hangs on "Checking the connection to Microsoft" when the RTC is years behind).
+        local bd; bd=$(date -u +%Y%m%d)
+        sed -e "s/^set BUILDDATE=.*/set BUILDDATE=$bd/" \
+            -e "s/^set BMM=.*/set BMM=${bd:4:2}\&set BDD=${bd:6:2}\&set BYY=${bd:0:4}/" \
+            "$(dirname "$0")/setclock.cmd" > "$STAGING/setclock.cmd" || die "setclock.cmd missing"
+        log "setclock.cmd staged (build date $bd)"
+    else
+        log "no autounattend.xml ($unattend) — OOBE left stock"
+    fi
+
     # Volume label: WIN_11_26200_8328_X64_EN-US (max 32 chars)
     [[ -z "$BUILD" ]] && BUILD="unknown"
     local clean_build="${BUILD//./_}"
@@ -573,7 +664,7 @@ build_iso() {
 
     # Output filename is overridable via OUTPUT_ISO_NAME for one-off builds of
     # other families (e.g. 23H2). Default preserves the daily 25H2 naming.
-    local output_iso="$WORK_DIR/${OUTPUT_ISO_NAME:-Win11-25H2-Pro-${BUILD}-RST-Rufus.iso}"
+    local output_iso="$WORK_DIR/${OUTPUT_ISO_NAME:-Win11-26H2-Pro-${BUILD}-RST-Rufus.iso}"
 
     # Verify boot files exist in staging
     local bios_boot="$STAGING/boot/etfsboot.com"
@@ -634,7 +725,7 @@ build_iso() {
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 main() {
-    echo -e "\n${BO}${B}Windows 11 25H2 Pro ISO Builder${NC}"
+    echo -e "\n${BO}${B}Windows 11 ${TARGET_VERSION_NAME} Pro ISO Builder${NC}"
     echo -e "${C}Kit: $KIT_DIR${NC}\n"
 
     # Allow re-running from a checkpoint by checking env vars
@@ -678,6 +769,7 @@ main() {
     apply_option_8
     inject_rst_drivers
     copy_enabler_script
+    bake_oobe_registry
     build_iso
 
     echo -e "\n${G}${BO}All done.${NC}"

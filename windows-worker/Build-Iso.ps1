@@ -215,7 +215,7 @@ try {
 }
 
 # 7. Move ISO to BuildOut with canonical name
-$finalName = "Win11-25H2-Pro-$Build-vanilla.iso"
+$finalName = "Win11-$Build-vanilla.iso"
 $finalPath = Join-Path $OutDir $finalName
 if (Test-Path $finalPath) { Remove-Item $finalPath -Force }
 Move-Item -Path $iso.FullName -Destination $finalPath
